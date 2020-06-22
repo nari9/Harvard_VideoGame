@@ -1,0 +1,521 @@
+---
+title: "Predicting Sales of Video Games"
+author: "Nabeel Arif"
+date: "21/06/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+if(!require(knitr)) install.packages("gridExtra", repos = "http://cran.us.r-project.org")
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(gridExtra)) install.packages("gridExtra", repos = "http://cran.us.r-project.org")
+if(!require(Hmisc)) install.packages("gridExtra", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(kableExtra)) install.packages("kableExtra", repos = "http://cran.us.r-project.org")
+if(!require(glmnet)) install.packages("gridExtra", repos = "http://cran.us.r-project.org")
+if(!require(randomForest)) install.packages("randomForest", repos = "http://cran.us.r-project.org")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, echo=FALSE}
+library(knitr)
+library(tidyverse)
+library(gridExtra)
+library(Hmisc)
+library(caret)
+library(kableExtra)
+library(glmnet)
+library(randomForest)
+```
+
+# Introduction
+
+Video games are a multi-billion dollar industry with vast sales across the various regions in the world. The aim of this project to predict sales in North America based on historical sales data.
+
+The data used for this analysis was obtained from Kaggle via the below link:
+
+https://www.kaggle.com/rush4ratio/video-game-sales-with-ratings/data
+
+We will clean the data ready for exploration and visualization and then create models to predict North American sales. How well the models perform will be measured by the residual mean squared error (RMSE) and we will try various techniques and models to get this as low as possible.
+
+
+
+# Data Pre-Processing
+
+Before we can use or even visualize the data we need to manipulate it into a format to do so. An overview of the data shows that the data is already spread into rows and columns:
+
+```{r file download, echo=FALSE}
+# download raw data file from git repo
+URL <- tempfile()
+download.file("https://github.com/nari9/Harvard_VideoGame/raw/master/videogames_data.csv",URL)
+data <- read.csv(file=URL)
+```
+
+```{r file overview, echo=TRUE}
+# view raw data file
+data %>% as_tibble()
+
+```
+
+
+The downloaded dataset has over 16000 rows and 16 columns, however as we will see some of this is not useable. Firstly the dataset details from Kaggle provide information on the data that it contains data up to November 2016 so any rows in 'Year_of_Release' post 2016 can be ignored.
+
+```{r filter post 2016, echo=TRUE, warning=FALSE}
+# filter out rows post 2016
+data <- data %>% filter((as.numeric(as.character(data$Year_of_Release)))<=2016)
+
+```
+
+The User_Score column values are stored as factors which is incorrect and we need to update these to numeric.
+
+```{r user_score to numeric, echo=TRUE, warning=FALSE}
+# Update User_Score column to numeric
+data$User_Score <- as.numeric(as.character(data$User_Score))
+
+```
+
+Secondly there are a number of rows where data is missing (NA) or blank. This causes an issue as the model features require this in order to generate predictions. We can either estimate these, for example we could find the mean of the Critic_Score and use this value to fill in the missing values. However, in this case that would not be suitable as reviews or scores are subjective, what one person likes another may not. Further, for critical scores there is a count of critics who provided a score, so each score carries a weight and just using the mean is too simplistic.
+
+Note however that for sales figures some rows have a zero value. This is not missing data rather actually indicates no sales and therefore this data will remain.
+
+```{r data clean, echo=TRUE}
+# overview of columns with NA
+colSums(is.na(data))
+
+# remove rows that have any NA values
+data <- na.omit(data)
+
+# overview of columns with blanks
+colSums(data == '')
+
+# remove rows with blank data
+game_sales <- data %>% filter(Developer != '' & Rating != '')
+
+```
+
+```{r remove object, echo = FALSE}
+# remove data object
+rm(data)
+```
+
+
+
+# Data Exploration and Visualization
+
+Now we have the data in a clean format we can explore and visualize and see if we can identify any patterns. Firstly, we'll look at the various platforms available for video games and see how sales figures vary.
+
+```{r plot platform sales, echo = FALSE}
+# plot total sales per platform
+platform_sales <- game_sales %>% 
+	group_by(Platform) %>% 
+	summarise(NA_Sales = sum(NA_Sales)) %>% ggplot(aes(x = Platform, y = NA_Sales)) + 
+	geom_bar(stat="identity", fill="steelblue") +
+	ylab("North America Sales (million units)") +
+	theme(panel.background = element_rect(fill = "white", colour = "white", size = 0.5, linetype = "solid"),
+		axis.line = element_line(colour = "black")) +
+	ggtitle("Video Game Sales per Platform")
+platform_sales
+
+```
+
+We can see that some platforms are more popular than others. Next, we'll see how sales figures have changed over time.
+
+```{r time series plot, echo=FALSE}
+# Group sales data by release year
+year_data <- game_sales %>% group_by(Year_of_Release) %>% 
+  summarise(NA_Sales = sum(NA_Sales))
+
+# Update release year data to be numeric
+year_data$Year_of_Release <- as.numeric(as.character(year_data$Year_of_Release))
+
+# time series plot of sales
+time_plot <- year_data %>%
+  ggplot(aes(Year_of_Release, NA_Sales)) +
+  geom_line() +
+  ylab("North America Sales (million units)") + 
+  theme_bw()
+time_plot
+
+```
+
+Let us continue to make plots for sales against genre, critic score and user score.
+
+```{r plots of genre and scores, echo = FALSE}
+# plot of genre vs sales
+genre_plot <- game_sales %>% 
+	group_by(Genre) %>% 
+	summarise(NA_Sales = sum(NA_Sales)) %>% 
+	ggplot(aes(x = Genre, y = NA_Sales)) + 
+	geom_bar(stat="identity", fill="steelblue") +
+	ylab("North America Sales (million units)") +
+	theme(panel.background = element_rect(fill = "white", colour = "white", size = 0.5, linetype = "solid"),
+		axis.line = element_line(colour = "black")) +
+	ggtitle("Video Games Sales per Genre")
+genre_plot
+
+# plot of critic score vs avg sales
+critic_plot <- game_sales %>% 
+	group_by(Critic_Score) %>% 
+	summarise(avg = mean(NA_Sales)) %>% 
+	ggplot(aes(Critic_Score, avg)) + 
+	geom_point() + 
+	ylab("Average Sales") +
+	theme_bw()
+
+# plot of user score vs avg sales
+user_plot <- game_sales %>% 
+	group_by(User_Score) %>% 
+	summarise(avg = mean(NA_Sales)) %>% 
+	ggplot(aes(User_Score, avg)) + 
+	geom_point() + 
+	ylab("Average Sales") +
+	theme_bw()
+
+# arrange plots
+grid.arrange(critic_plot, user_plot, ncol=2)
+
+```
+
+We can see a positive relationship, almost linear relationship between critic and user score and sales with very high critic scores relating to very high sales that do not fall within that linear relationship. We can also look at the "best" games, those rated the highest by critics.
+
+```{r top 10 games, echo=FALSE}
+# top 10 best games not taking platform into account
+best_games <- game_sales %>% 
+  select(Name, Platform, NA_Sales, Critic_Score, Critic_Count) %>%
+  arrange(desc(Critic_Score)) %>% 
+  head(10)
+best_games
+
+```
+
+From this it's' quite evident that the same game i.e. same name, but on different platforms can appear so let's take that into account and group by name, and take the average critic score and total number of critics for the same games. However, note that not all games are available across all platforms.
+
+```{r top 10 games grouped, echo=FALSE}
+# top 10 best games ignoring platform
+best_games_grouped <- game_sales %>% 
+  group_by(Name) %>% 
+  summarise(NA_Sales = sum(NA_Sales), 
+            Avg_Critic_Score = mean(Critic_Score), 
+            Total_Critics = sum(Critic_Count)) %>% 
+  arrange(desc(Avg_Critic_Score)) %>% 
+  head(10)
+best_games_grouped
+
+```
+
+Similarly we can see the "worst" games with platform,
+
+```{r worst games, echo=FALSE}
+# worst games not taking platform into account
+worst_games <- game_sales %>% 
+  select(Name, Platform, NA_Sales, Critic_Score, Critic_Count) %>%
+  arrange(Critic_Score) %>% 
+  head(10)
+worst_games
+
+```
+
+and grouping games with the same name.
+
+```{r worst games grouped, echo=FALSE}
+# worst games ignoring platform
+worst_games_grouped <- game_sales %>% 
+  group_by(Name) %>% 
+  summarise(NA_Sales = sum(NA_Sales), 
+            Avg_Critic_Score = mean(Critic_Score), 
+            Total_Critics = sum(Critic_Count)) %>% 
+  arrange((Avg_Critic_Score)) %>% 
+  head(10)
+worst_games_grouped
+
+```
+
+We have not shown it here but we can also obtain the same results for "best" and "worst" games according to User_Score.
+
+Lastly let's' see if we can find any correlation between the numeric fields; NA_Sales, Critic_Score, Critic_Count, User_Score and User_Count.
+
+```{r correlation, echo=TRUE}
+# correlation between features by rank
+corr_matrix <- cor(game_sales[, c(6, 11:14)], method = "spearman")
+corr_matrix
+```
+
+We can see the positive relationship between scores and sales discussed earlier.
+
+
+
+# Methods & Models
+
+## Naive Model
+
+Before we build a model, we need to split the data as we will train the models on a training set of the data and predict sales figures on a test set. This is split as 80% for training and 20% for testing respectively. This split has been chosen as we will have several features so need a larger validation set to test this on.
+
+```{r set seed, echo=FALSE, warning=FALSE}
+# set seed to replicate report results
+set.seed(1, sample.kind="Rounding")
+# if using R 3.5 or earlier, use `set.seed(1)` instead
+```
+
+```{r test train split, echo=TRUE}
+# split data into training and test sets
+test_index <- createDataPartition(y = game_sales$NA_Sales, times = 1, p = 0.2, list = FALSE)
+
+# define training set
+train_set <- game_sales[-test_index,]
+
+# define test set
+test_set <- game_sales[test_index,]
+
+```
+
+The models will need to be compared in terms of effectiveness so we will use the RMSE to do so. This is defined as below
+
+$$RMSE = \sqrt{\frac{1}{N}\sum_{g,c} (\hat{y}_{g,c} - y_{g,c})^2  }$$
+
+We define $y_{g,c}$ as the sales figure for game g and critic score c and $\hat{y}_{g,c}$ our estimate with the best model having the lowest RMSE value.
+
+Now we can build a naive model which will serve as a benchmark for all models. We can define this model as:
+
+$$Y_{g,c} = \mu + \varepsilon_{g,c}$$
+
+Where $Y_{g,c}$ is the predicted sales of game $g$ and critic score $c$ and $\varepsilon_{c,g}$ independent errors and $\mu$ the average sales for all games. We know that the estimate that minimizes the RMSE is the least squares estimate of $\mu$ which is just the average.
+
+```{r calculate average, echo=TRUE}
+# average NA sales
+mu_hat <- mean(train_set$NA_Sales)
+mu_hat
+
+```
+
+We can use this to calculate RMSE.
+
+```{r naive rmse, echo=TRUE}
+# calculate RMSE for naive model
+naive_rmse <- RMSE(test_set$NA_Sales, mu_hat)
+```
+
+```{r naive results, echo=FALSE}
+# create tibble for calculated RMSE
+rmse_model1 <- tibble(Model = "Naive", 
+                      Predicted_RMSE = naive_rmse)
+
+# store RMSE for naive model to a results table
+rmse_results <- rmse_model1
+
+# print table with Model 1 RMSE result
+rmse_results %>% kable() %>% 
+   kable_styling(full_width = FALSE) %>%
+   row_spec(1, bold = TRUE)
+
+```
+
+The RMSE for a naive approach is under one which is a good sign, however, now that we have established a benchmark, we can try other models to reduce this.
+
+
+
+## Linear Regression Model
+
+From the data we can see that some games are scored higher than others. We can therefore add an extra term to our model, $b_c$, to represent the score given. (Note that each row in the data is unique in terms of, one game on a certain platform, can only have one critic score)
+
+$$Y_{g,c} = \mu + b_c + \varepsilon_{g,c}$$
+
+Just like there is consideration taken for the critic score, we also need to consider user score $b_u$, platform $b_p$, genre $b_a$, critic count $b_d$ and user count $b_e$. So our model actually becomes:
+
+$$Y_{g,c} = \mu + b_c + b_u + b_p + b_a + b_d + b_e + \varepsilon$$
+
+```{r linear regression model, echo=TRUE, warning=FALSE}
+# build linear regression model on training set
+lr_model <- train(NA_Sales ~ Critic_Score + User_Score + Platform + Genre + 
+                    Critic_Count + User_Count,
+                data=train_set,
+                method="lm")
+				
+# generate predictions on test set
+y_hat <- predict(lr_model, test_set)
+
+# calculate RMSE for linear regression model
+lr_rmse<- RMSE(y_hat, test_set$NA_Sales)
+
+```
+
+```{r linear regression results, echo=FALSE}
+# create tibble for calculated RMSE
+rmse_model2 <- tibble(Model = "Linear Regression", 
+                      Predicted_RMSE = lr_rmse)
+
+# add linear regression results to results table
+rmse_results <- bind_rows(rmse_results, 
+                          rmse_model2)
+
+# print table of results for all models thus far
+rmse_results %>% knitr::kable()%>%
+   kable_styling(full_width = FALSE) %>%
+   row_spec(2, bold = TRUE)
+```
+
+We have managed to reduce our RMSE, however remember from the critic score against average sales plot we saw that for very high critic scores the resulting sales were also very high and did not follow a linear relationship. We'll continue to explore other models to see if we can improve.
+
+
+
+## Elastic Net Model
+
+From the data we can see that the “best” and “worst” scored games can have a low count of critics. This leads to large estimates of $b_c$ which can increase RMSE. Regularization permits us to penalize large estimates that are formed using small sample sizes.
+
+Specifically, instead of minimizing the least squares equation, we minimize an equation that adds a penalty:
+
+$$\frac{1}{N} \sum_{g,c} \left(y_{g,c} - \mu - b_c\right)^2 + \lambda \sum_{c} b_c^2$$
+
+This approach will have our desired effect: when our sample size $n_c$ is very large, a case which will give us a stable estimate, then the penalty $\lambda$ is effectively ignored since $n_c+\lambda \approx n_c$. However, when the $n_c$ is small, then the estimate $\hat{b}_c(\lambda)$ is shrunken towards 0. The larger $\lambda$, the more we shrink. Note however that $\lambda$ is a tuning parameter and we can use cross-validation to choose it.
+
+We can use regularization for the other effects also and penalize large estimates. The above formula is for a L2 Regularization where the penalty term, b, is squared whereas as L1 regularization uses the absolute value of b. Elastic Net models utilises both and introduces another parameter $\alpha$ which again can be tuned and we will use this for our model.
+
+```{r elastic net model, echo=TRUE, message=FALSE, warning=FALSE}
+# Set training control
+train_control <- trainControl(method = "repeatedcv",
+                              number = 5,
+                              repeats = 5,
+                              search = "random",
+                              verboseIter = FALSE)
+
+# train elastic net model on training data
+enet_model <- train(NA_Sales ~ Critic_Score + User_Score + Platform + Genre + 
+                      Critic_Count + User_Count,
+                           data = train_set,
+                           method = "glmnet",
+                           tuneLength = 25,
+                           trControl = train_control)
+
+# generate predictions on test data
+y_hat <- predict(enet_model, test_set)
+
+# calculate RMSE for Elastic Net model
+enet_rmse<- RMSE(y_hat, test_set$NA_Sales)
+```
+
+```{r elastic net results, echo=FALSE}
+# create tibble for calculated RMSE
+rmse_model3 <- tibble(Model = "Elastic Net", 
+                      Predicted_RMSE = enet_rmse)
+
+# add elastic net results to results table
+rmse_results <- bind_rows(rmse_results, 
+                          rmse_model3)
+
+# print table of results for all models thus far
+rmse_results %>% knitr::kable()%>%
+   kable_styling(full_width = FALSE) %>%
+   row_spec(3, bold = TRUE)
+
+```
+
+We have reduced RMSE but only incrementally. Let's take a different path to try and improve our model.
+
+
+
+## Random Forest
+
+Our last model will use a Random Forest which are used to improve predictions by generating many predictors, each using regression or classification trees, and then forming a final prediction based on the average prediction of all these trees. We will find the optimal model changing the parameter that controls the minimum number of data points in the nodes of the tree.
+
+```{r RF model setup, echo=FALSE, warning=FALSE}
+# set model control
+control <- trainControl(method="cv", number = 5)
+
+# create grid of values for mtry
+grid <- data.frame(mtry = c(1, 5, 10, 25, 50, 100))
+
+# optimize algorithm
+train_rf <-  train(NA_Sales ~ Critic_Score + User_Score + Platform + Genre + 
+                     Critic_Count + User_Count, 
+				   data = train_set,
+                   method = "rf", 
+                   ntree = 200,
+                   trControl = control,
+                   tuneGrid = grid)
+```
+
+We can see the results of the tuning and how the error is affected by changes in parameters.
+
+```{r RF parameter plot, echo=FALSE}
+# plot of results to show how error changes with parameters
+ggplot(train_rf)
+
+```
+
+We can then obtain the best value for our parameter and fit the final model.
+
+```{r RF model fit, echo=TRUE}
+# get parameter value that is best tune for model
+train_rf$bestTune
+
+# fit the model using optimized nodes
+fit_rf <- randomForest(NA_Sales ~ Critic_Score + User_Score + Platform + Genre + 
+                         Critic_Count + User_Count,
+					   data = train_set,
+                       minNode = train_rf$bestTune$mtry)
+
+```
+
+We check to ensure we have used enough trees to minimize error.
+
+```{r tree check, echo=FALSE}
+# check if we used enough trees
+plot(fit_rf)
+
+```
+
+The number of trees looks correct so we can now make our predictions and calculate RMSE.
+
+```{r RF predictions, echo=TRUE}
+# generate predictions on test data
+y_hat <- predict(fit_rf, test_set)
+
+# calculate RMSE for Random Forest model
+rf_rmse <- RMSE(y_hat, test_set$NA_Sales)
+
+```
+
+```{r RF results, echo=FALSE}
+# create tibble for calculated RMSE
+rmse_model4 <- tibble(Model = "Random Forest", 
+                      Predicted_RMSE = rf_rmse)
+
+# add random forest results to results table
+rmse_results <- bind_rows(rmse_results, 
+                          rmse_model4)
+
+# print table of results for all models thus far
+rmse_results %>% knitr::kable()%>%
+   kable_styling(full_width = FALSE) %>%
+   row_spec(4, bold = TRUE)
+
+```
+
+The result from the Random Forest does reduce RMSE further and in fact provides the lowest RMSE of all models.
+
+
+
+# Results
+
+Below is a summary of the models used and their respective RMSE.
+
+```{r final results, echo=FALSE}
+# final results table
+rmse_results %>% knitr::kable()%>%
+   kable_styling(full_width = FALSE) %>%
+   column_spec(2, bold = TRUE)
+
+```
+
+We can see that a naive model yields the highest RMSE which is expected as it does not consider any feature bias. As we move through the models there is an incremental improvement with Random Forests providing the best results which is not surprising since a Random Forest model generates many predictors and then averages.
+
+
+
+# Conclusion
+
+We have managed to build a model with a low RMSE when predicting North American sales of video games. This was done so by taking into account the different features and bias within the data and incorporating these into the models.
+
+There are a few issues or limitations of these models. Firstly, the original data set from Kaggle had to be cleaned which resulted in more than half of the original data being removed, thus resulting in a smaller data set. This can lead to overfitting as we have less data to train with.
+
+Another factor to consider is that critic and user scores are only received once a game has been released. So those features would need to be ignored if modelling pre-release.
+
+Improvements to the model can include matrix factorization and looking at relationships within the data such as if a certain region has a strong affiliation with a particular platform or genre.
